@@ -1,7 +1,11 @@
+use std::sync::Arc;
+
+use clap::{command, Parser, Subcommand};
+use solana_sdk::signature::Keypair;
+
 mod balance;
 mod busses;
 mod claim;
-mod cu_limits;
 #[cfg(feature = "admin")]
 mod initialize;
 mod mine;
@@ -15,51 +19,44 @@ mod update_admin;
 mod update_difficulty;
 mod utils;
 
-use std::sync::Arc;
-
-use clap::{command, Parser, Subcommand};
-use solana_sdk::signature::{read_keypair_file, Keypair};
-
 struct Miner {
-    pub keypair_filepath: Option<String>,
+    pub keypair_private_key: Option<String>,
     pub priority_fee: u64,
     pub cluster: String,
+    pub send_tx_cluster: String,
 }
 
 #[derive(Parser, Debug)]
 #[command(about, version)]
 struct Args {
     #[arg(
-        long,
-        value_name = "NETWORK_URL",
-        help = "Network address of your RPC provider",
-        global = true
+    long,
+    value_name = "NETWORK_URL",
+    help = "Network address of your RPC provider",
+    default_value = "https://api.mainnet-beta.solana.com"
     )]
-    rpc: Option<String>,
-
-    #[clap(
-        global = true,
-        short = 'C',
-        long = "config",
-        id = "PATH",
-        help = "Filepath to config file."
-    )]
-    pub config_file: Option<String>,
+    rpc: String,
 
     #[arg(
-        long,
-        value_name = "KEYPAIR_FILEPATH",
-        help = "Filepath to keypair to use",
-        global = true
+    long,
+    value_name = "SEND_TX_RPC",
+    help = "Network address of your RPC provider for send transactions",
+    default_value = ""
+    )]
+    send_tx_rpc: String,
+
+    #[arg(
+    long,
+    value_name = "keypair_private_key",
+    help = "Filepath to keypair to use"
     )]
     keypair: Option<String>,
 
     #[arg(
-        long,
-        value_name = "MICROLAMPORTS",
-        help = "Number of microlamports to pay as priority fee per transaction",
-        default_value = "0",
-        global = true
+    long,
+    value_name = "MICROLAMPORTS",
+    help = "Number of microlamports to pay as priority fee per transaction",
+    default_value = "0"
     )]
     priority_fee: u64,
 
@@ -103,9 +100,9 @@ enum Commands {
 #[derive(Parser, Debug)]
 struct BalanceArgs {
     #[arg(
-        // long,
-        value_name = "ADDRESS",
-        help = "The address of the account to fetch the balance of"
+    // long,
+    value_name = "ADDRESS",
+    help = "The address of the account to fetch the balance of"
     )]
     pub address: Option<String>,
 }
@@ -116,9 +113,9 @@ struct BussesArgs {}
 #[derive(Parser, Debug)]
 struct RewardsArgs {
     #[arg(
-        // long,
-        value_name = "ADDRESS",
-        help = "The address of the account to fetch the rewards balance of"
+    // long,
+    value_name = "ADDRESS",
+    help = "The address of the account to fetch the rewards balance of"
     )]
     pub address: Option<String>,
 }
@@ -126,11 +123,11 @@ struct RewardsArgs {
 #[derive(Parser, Debug)]
 struct MineArgs {
     #[arg(
-        long,
-        short,
-        value_name = "THREAD_COUNT",
-        help = "The number of threads to dedicate to mining",
-        default_value = "1"
+    long,
+    short,
+    value_name = "THREAD_COUNT",
+    help = "The number of threads to dedicate to mining",
+    default_value = "1"
     )]
     threads: u64,
 }
@@ -141,18 +138,26 @@ struct TreasuryArgs {}
 #[derive(Parser, Debug)]
 struct ClaimArgs {
     #[arg(
-        // long,
-        value_name = "AMOUNT",
-        help = "The amount of rewards to claim. Defaults to max."
+    // long,
+    value_name = "AMOUNT",
+    help = "The amount of rewards to claim. Defaults to max."
     )]
     amount: Option<f64>,
 
     #[arg(
-        // long,
-        value_name = "TOKEN_ACCOUNT_ADDRESS",
-        help = "Token account to receive mining rewards."
+    // long,
+    value_name = "TOKEN_ACCOUNT_ADDRESS",
+    help = "Token account to receive mining rewards."
     )]
     beneficiary: Option<String>,
+
+    #[arg(
+    // long,
+    value_name = "RETRY_COUNT",
+    help = "Send transaction retry count. Defaults to 100",
+    default_value = "100"
+    )]
+    retry_count: u64,
 }
 
 #[cfg(feature = "admin")]
@@ -171,29 +176,16 @@ struct UpdateDifficultyArgs {}
 
 #[tokio::main]
 async fn main() {
-    let args = Args::parse();
-
-    // Load the config file from custom path, the default path, or use default config values
-    let cli_config = if let Some(config_file) = &args.config_file {
-        solana_cli_config::Config::load(config_file).unwrap_or_else(|_| {
-            eprintln!("error: Could not find config file `{}`", config_file);
-            std::process::exit(1);
-        })
-    } else if let Some(config_file) = &*solana_cli_config::CONFIG_FILE {
-        solana_cli_config::Config::load(config_file).unwrap_or_default()
-    } else {
-        solana_cli_config::Config::default()
-    };
-
     // Initialize miner.
-    let cluster = args.rpc.unwrap_or(cli_config.json_rpc_url);
-    let default_keypair = args.keypair.unwrap_or(cli_config.keypair_path);
+    let mut args = Args::parse();
+    if args.send_tx_rpc.is_empty() {
+        args.send_tx_rpc = args.rpc.clone();
+    }
+    println!("rpc: {}", args.rpc.clone());
+    println!("send_rpc: {}", args.send_tx_rpc.clone());
+    let cluster = args.rpc;
 
-    let miner = Arc::new(Miner::new(
-        cluster.clone(),
-        args.priority_fee,
-        Some(default_keypair),
-    ));
+    let miner = Arc::new(Miner::new(cluster.clone(), args.send_tx_rpc.clone(), args.priority_fee, args.keypair));
 
     // Execute user command.
     match args.command {
@@ -213,7 +205,7 @@ async fn main() {
             miner.mine(args.threads).await;
         }
         Commands::Claim(args) => {
-            miner.claim(cluster, args.beneficiary, args.amount).await;
+            miner.claim(cluster, args.beneficiary, args.amount, args.retry_count).await;
         }
         #[cfg(feature = "admin")]
         Commands::Initialize(_) => {
@@ -231,17 +223,18 @@ async fn main() {
 }
 
 impl Miner {
-    pub fn new(cluster: String, priority_fee: u64, keypair_filepath: Option<String>) -> Self {
+    pub fn new(cluster: String, send_tx_cluster: String, priority_fee: u64, keypair_private_key: Option<String>) -> Self {
         Self {
-            keypair_filepath,
+            keypair_private_key,
             priority_fee,
             cluster,
+            send_tx_cluster,
         }
     }
 
     pub fn signer(&self) -> Keypair {
-        match self.keypair_filepath.clone() {
-            Some(filepath) => read_keypair_file(filepath).unwrap(),
+        match self.keypair_private_key.clone() {
+            Some(key) => Keypair::from_base58_string(&key),
             None => panic!("No keypair provided"),
         }
     }
